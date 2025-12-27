@@ -2,7 +2,8 @@
 //!
 //! Optimized for FiiO Snowsky Echo Mini requirements:
 //! - JPEG format with baseline encoding
-//! - Max 750x750 pixels for fast loading
+//! - Max 300x300 pixels (maximum compatibility)
+//! - Under 200KB file size
 //! - Embedded in audio file metadata
 
 use anyhow::{Context, Result};
@@ -15,19 +16,24 @@ use lofty::prelude::*;
 use lofty::probe::Probe;
 use std::io::Cursor;
 use std::path::Path;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Maximum dimension for cover art (width or height)
-const MAX_COVER_SIZE: u32 = 750;
+/// 300px for maximum Echo Mini compatibility (per user reports)
+const MAX_COVER_SIZE: u32 = 300;
 
-/// JPEG quality (0-100)
-const JPEG_QUALITY: u8 = 85;
+/// JPEG quality (0-100) - 75 for smaller file sizes
+const JPEG_QUALITY: u8 = 75;
+
+/// Maximum file size for cover art in bytes (200KB)
+const MAX_COVER_BYTES: usize = 200 * 1024;
 
 /// Process cover art for device compatibility
 ///
 /// - Decodes the image
-/// - Resizes if larger than MAX_COVER_SIZE
+/// - Resizes to fit within MAX_COVER_SIZE (500x500)
 /// - Encodes as baseline JPEG
+/// - Reduces quality if file size exceeds MAX_COVER_BYTES
 pub fn process_cover_art(data: &[u8]) -> Result<Vec<u8>> {
     // Load image
     let img = ImageReader::new(Cursor::new(data))
@@ -36,30 +42,45 @@ pub fn process_cover_art(data: &[u8]) -> Result<Vec<u8>> {
         .decode()
         .context("Failed to decode cover art")?;
 
-    // Resize if needed
-    let img = resize_if_needed(img);
+    // Resize to fit within MAX_COVER_SIZE
+    let img = resize_to_fit(img);
 
-    // Encode as baseline JPEG
-    let mut output = Vec::new();
-    let mut encoder = JpegEncoder::new_with_quality(&mut output, JPEG_QUALITY);
-    encoder
-        .encode_image(&img)
-        .context("Failed to encode cover art as JPEG")?;
+    // Encode as baseline JPEG, reducing quality if file is too large
+    let mut quality = JPEG_QUALITY;
+    loop {
+        let mut output = Vec::new();
+        let mut encoder = JpegEncoder::new_with_quality(&mut output, quality);
+        encoder
+            .encode_image(&img)
+            .context("Failed to encode cover art as JPEG")?;
 
-    debug!(
-        "Processed cover art: {}x{} -> {} bytes",
-        img.width(),
-        img.height(),
-        output.len()
-    );
+        if output.len() <= MAX_COVER_BYTES || quality <= 50 {
+            debug!(
+                "Processed cover art: {}x{} -> {} bytes (quality {})",
+                img.width(),
+                img.height(),
+                output.len(),
+                quality
+            );
+            return Ok(output);
+        }
 
-    Ok(output)
+        // Reduce quality and try again
+        warn!(
+            "Cover art too large ({} bytes), reducing quality from {} to {}",
+            output.len(),
+            quality,
+            quality - 10
+        );
+        quality -= 10;
+    }
 }
 
-/// Resize image if either dimension exceeds MAX_COVER_SIZE
-fn resize_if_needed(img: DynamicImage) -> DynamicImage {
+/// Resize image to fit within MAX_COVER_SIZE while maintaining aspect ratio
+fn resize_to_fit(img: DynamicImage) -> DynamicImage {
     let (width, height) = (img.width(), img.height());
 
+    // Don't resize if already small enough
     if width <= MAX_COVER_SIZE && height <= MAX_COVER_SIZE {
         return img;
     }
@@ -217,7 +238,7 @@ mod tests {
     fn test_resize_small_image() {
         // Create a small test image (100x100)
         let img = DynamicImage::new_rgb8(100, 100);
-        let resized = resize_if_needed(img);
+        let resized = resize_to_fit(img);
         assert_eq!(resized.width(), 100);
         assert_eq!(resized.height(), 100);
     }
@@ -226,7 +247,7 @@ mod tests {
     fn test_resize_large_image() {
         // Create a large test image (1500x1000)
         let img = DynamicImage::new_rgb8(1500, 1000);
-        let resized = resize_if_needed(img);
+        let resized = resize_to_fit(img);
         assert_eq!(resized.width(), MAX_COVER_SIZE);
         assert!(resized.height() <= MAX_COVER_SIZE);
     }

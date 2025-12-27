@@ -124,7 +124,7 @@ pub async fn devices(detailed: bool) -> Result<()> {
 }
 
 /// Handle the `browse` command
-pub async fn browse(start_artists: bool, start_playlists: bool) -> Result<()> {
+pub async fn browse(_start_artists: bool, start_playlists: bool) -> Result<()> {
     let creds = AuthManager::load().map_err(|_| {
         anyhow::anyhow!("No credentials found. Run 'nutune auth' first to configure.")
     })?;

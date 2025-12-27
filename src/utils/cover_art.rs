@@ -15,7 +15,6 @@ use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use std::io::Cursor;
-use std::path::Path;
 use tracing::{debug, warn};
 
 /// Maximum dimension for cover art (width or height)
@@ -100,58 +99,6 @@ fn resize_to_fit(img: DynamicImage) -> DynamicImage {
     );
 
     img.resize(new_width, new_height, FilterType::Lanczos3)
-}
-
-/// Embed cover art into an audio file
-///
-/// Supports MP3, FLAC, OGG, M4A and other formats via lofty
-pub fn embed_cover_art(audio_path: &Path, cover_data: &[u8]) -> Result<()> {
-    // Process cover art first
-    let processed_cover = process_cover_art(cover_data)?;
-
-    // Open the audio file
-    let mut tagged_file = Probe::open(audio_path)
-        .context("Failed to open audio file")?
-        .read()
-        .context("Failed to read audio file tags")?;
-
-    // Create the picture
-    let picture = Picture::new_unchecked(
-        PictureType::CoverFront,
-        Some(MimeType::Jpeg),
-        None,
-        processed_cover,
-    );
-
-    // Get the primary tag (or create one)
-    let tag = match tagged_file.primary_tag_mut() {
-        Some(tag) => tag,
-        None => {
-            // Try to get any tag, or insert a new one based on file type
-            if let Some(tag) = tagged_file.first_tag_mut() {
-                tag
-            } else {
-                // Determine appropriate tag type based on file
-                let tag_type = tagged_file.primary_tag_type();
-                tagged_file.insert_tag(lofty::tag::Tag::new(tag_type));
-                tagged_file
-                    .primary_tag_mut()
-                    .context("Failed to create tag")?
-            }
-        }
-    };
-
-    // Remove existing cover art and add new one
-    tag.remove_picture_type(PictureType::CoverFront);
-    tag.push_picture(picture);
-
-    // Save the file
-    tagged_file
-        .save_to_path(audio_path, WriteOptions::default())
-        .context("Failed to save audio file with embedded cover")?;
-
-    debug!("Embedded cover art in: {}", audio_path.display());
-    Ok(())
 }
 
 /// Embed cover art into audio data in memory (before writing to disk)

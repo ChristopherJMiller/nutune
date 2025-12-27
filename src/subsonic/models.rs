@@ -12,7 +12,6 @@ pub struct SubsonicResponse<T> {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubsonicResponseInner<T> {
     pub status: String,
-    pub version: String,
     #[serde(flatten)]
     pub data: Option<T>,
     pub error: Option<SubsonicError>,
@@ -38,7 +37,6 @@ pub struct ArtistsIndex {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArtistIndex {
-    pub name: String,
     #[serde(default)]
     pub artist: Vec<Artist>,
 }
@@ -62,12 +60,6 @@ pub struct ArtistData {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArtistWithAlbums {
-    pub id: String,
-    pub name: String,
-    #[serde(rename = "albumCount")]
-    pub album_count: Option<u32>,
-    #[serde(rename = "coverArt")]
-    pub cover_art: Option<String>,
     #[serde(default)]
     pub album: Vec<Album>,
 }
@@ -97,18 +89,6 @@ pub struct AlbumData {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AlbumWithSongs {
-    pub id: String,
-    pub name: String,
-    pub artist: Option<String>,
-    #[serde(rename = "artistId")]
-    pub artist_id: Option<String>,
-    #[serde(rename = "coverArt")]
-    pub cover_art: Option<String>,
-    #[serde(rename = "songCount")]
-    pub song_count: Option<u32>,
-    pub duration: Option<u32>,
-    pub year: Option<u32>,
-    pub genre: Option<String>,
     #[serde(default)]
     pub song: Vec<Song>,
 }
@@ -171,15 +151,6 @@ pub struct PlaylistData {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlaylistWithSongs {
-    pub id: String,
-    pub name: String,
-    #[serde(rename = "songCount")]
-    pub song_count: Option<u32>,
-    pub duration: Option<u32>,
-    pub owner: Option<String>,
-    pub public: Option<bool>,
-    #[serde(rename = "coverArt")]
-    pub cover_art: Option<String>,
     #[serde(default, rename = "entry")]
     pub songs: Vec<Song>,
 }

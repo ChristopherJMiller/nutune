@@ -41,6 +41,11 @@ impl Downloader {
         }
     }
 
+    /// Get a clone of the client Arc for parallel operations
+    pub fn client_arc(&self) -> Arc<SubsonicClient> {
+        self.client.clone()
+    }
+
     /// Download multiple songs in parallel with progress
     pub async fn download_batch(
         &self,
@@ -78,7 +83,7 @@ impl Downloader {
             .inspect(|result| {
                 progress.inc(1);
                 if let Ok(r) = result {
-                    progress.set_message(format!("{}", r.song.title));
+                    progress.set_message(r.song.title.to_string());
                 }
             })
             .collect()

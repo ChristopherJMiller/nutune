@@ -12,7 +12,7 @@ pub use auth::AuthManager;
 #[command(version, author)]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 
     /// Enable verbose logging
     #[arg(short, long, global = true)]

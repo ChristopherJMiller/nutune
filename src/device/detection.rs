@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use tracing::{debug, info};
 
+use super::config::{generate_device_uuid, DeviceConfigStore, DeviceIdentifiers};
+
 /// Detected removable device
 #[derive(Debug, Clone)]
 pub struct Device {
@@ -21,6 +23,20 @@ pub struct Device {
     pub free_space: u64,
     /// Filesystem type (e.g., "vfat", "exfat")
     pub fs_type: String,
+    /// Unique identifier for this device (stable across reconnects)
+    pub uuid: String,
+    /// User-defined friendly name (from config)
+    pub friendly_name: Option<String>,
+}
+
+impl Device {
+    /// Get the display name for this device (friendly name, label, or UUID)
+    pub fn display_name(&self) -> String {
+        self.friendly_name
+            .clone()
+            .or_else(|| self.label.clone())
+            .unwrap_or_else(|| self.uuid[..8.min(self.uuid.len())].to_string())
+    }
 }
 
 /// Detects mounted removable devices
@@ -29,6 +45,9 @@ pub struct DeviceDetector;
 impl DeviceDetector {
     /// Scan for mounted removable devices
     pub async fn scan() -> Result<Vec<Device>> {
+        // Load device config for friendly names
+        let mut config_store = DeviceConfigStore::load().unwrap_or_default();
+
         // Run lsblk with JSON output
         let output = Command::new("lsblk")
             .args([
@@ -56,19 +75,26 @@ impl DeviceDetector {
         let mut devices = Vec::new();
 
         for block_device in lsblk.blockdevices {
-            Self::collect_devices(&block_device, &mut devices);
+            Self::collect_devices(&block_device, &mut devices, &mut config_store);
         }
+
+        // Save config to update last_seen timestamps
+        let _ = config_store.save();
 
         debug!("Found {} removable devices", devices.len());
         Ok(devices)
     }
 
     /// Recursively collect removable devices from lsblk output
-    fn collect_devices(block: &BlockDevice, devices: &mut Vec<Device>) {
+    fn collect_devices(
+        block: &BlockDevice,
+        devices: &mut Vec<Device>,
+        config_store: &mut DeviceConfigStore,
+    ) {
         // Check if this is a mounted removable device
-        if block.hotplug == Some(true) || block.hotplug == Some(false) {
-            if let Some(mountpoint) = &block.mountpoint {
-                if !mountpoint.is_empty()
+        if (block.hotplug == Some(true) || block.hotplug == Some(false))
+            && let Some(mountpoint) = &block.mountpoint
+                && !mountpoint.is_empty()
                     && mountpoint != "[SWAP]"
                     && !mountpoint.starts_with("/boot")
                 {
@@ -80,12 +106,23 @@ impl DeviceDetector {
                         || mountpoint.starts_with("/mnt");
 
                     if is_removable {
-                        let size = block.size
-                            .or(block.fssize)
-                            .unwrap_or(0);
+                        let size = block.size.or(block.fssize).unwrap_or(0);
+                        let free_space = block.fsavail.unwrap_or(0);
+                        let fs_type = block.fstype.clone().unwrap_or_default();
 
-                        let free_space = block.fsavail
-                            .unwrap_or(0);
+                        // Generate UUID and get config
+                        let uuid =
+                            generate_device_uuid(block.label.as_deref(), size, &fs_type);
+
+                        // Get or create device config, update last_seen
+                        let identifiers = DeviceIdentifiers {
+                            label: block.label.clone(),
+                            size_bytes: size,
+                            fs_type: fs_type.clone(),
+                        };
+                        let device_config = config_store.get_or_create(&uuid, identifiers);
+                        device_config.last_seen = chrono::Utc::now();
+                        let friendly_name = device_config.friendly_name.clone();
 
                         devices.push(Device {
                             name: block.name.clone(),
@@ -93,17 +130,17 @@ impl DeviceDetector {
                             mount_point: PathBuf::from(mountpoint),
                             size,
                             free_space,
-                            fs_type: block.fstype.clone().unwrap_or_default(),
+                            fs_type,
+                            uuid,
+                            friendly_name,
                         });
                     }
                 }
-            }
-        }
 
         // Check children
         if let Some(children) = &block.children {
             for child in children {
-                Self::collect_devices(child, devices);
+                Self::collect_devices(child, devices, config_store);
             }
         }
     }
@@ -137,11 +174,6 @@ impl DeviceDetector {
         }
 
         Ok(None)
-    }
-
-    /// Check if a device is still mounted
-    pub async fn is_mounted(device: &Device) -> bool {
-        device.mount_point.exists()
     }
 
     /// Get unmounted but available devices (for offering to mount)

@@ -1,5 +1,6 @@
 //! Device detection and storage module
 
+pub mod config;
 pub mod detection;
 pub mod manifest;
 pub mod storage;

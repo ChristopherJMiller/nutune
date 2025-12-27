@@ -126,9 +126,4 @@ impl SyncManifest {
         self.synced_playlists.push(playlist);
         self.last_sync = Utc::now();
     }
-
-    /// Update last sync time
-    pub fn touch(&mut self) {
-        self.last_sync = Utc::now();
-    }
 }

@@ -1,15 +1,19 @@
 //! Sync engine orchestration
 
 use anyhow::Result;
+use bytes::Bytes;
 use chrono::Utc;
+use futures::stream::{self, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::device::{DeviceStorage, SyncManifest, SyncedAlbum, SyncedPlaylist};
 use crate::subsonic::{Album, Playlist, SubsonicClient, SyncSelection};
 use crate::sync::downloader::{DownloadTask, DownloadResult, Downloader};
+use crate::sync::pipeline::{DownloadedTrack, PipelineConfig, process_tracks_parallel};
 use crate::utils::cover_art;
 
 /// Progress updates sent during sync
@@ -83,6 +87,7 @@ pub struct SyncEngine {
     manifest: SyncManifest,
     downloader: Downloader,
     device_path: PathBuf,
+    pipeline_config: PipelineConfig,
 }
 
 impl SyncEngine {
@@ -99,12 +104,19 @@ impl SyncEngine {
 
         let downloader = Downloader::new(client.clone(), parallel);
 
+        // Configure pipeline with download parallelism from param, processing at half
+        let pipeline_config = PipelineConfig {
+            download_parallelism: parallel,
+            processing_parallelism: (parallel / 2).max(1),
+        };
+
         Ok(Self {
             client,
             storage,
             manifest,
             downloader,
             device_path,
+            pipeline_config,
         })
     }
 
@@ -261,7 +273,7 @@ impl SyncEngine {
         Ok(result)
     }
 
-    /// Sync a single album with progress reporting
+    /// Sync a single album with progress reporting (pipelined parallel version)
     async fn sync_album_with_progress(
         &mut self,
         album: &Album,
@@ -277,10 +289,19 @@ impl SyncEngine {
 
         info!("Syncing album: {} - {}", artist, album.name);
 
-        // Download cover art first (needed for embedding)
-        let cover_data = if let Some(cover_id) = &album.cover_art {
+        // Download and process cover art first (cached for all tracks)
+        let processed_cover: Option<Arc<Vec<u8>>> = if let Some(cover_id) = &album.cover_art {
             match self.downloader.download_cover_art(cover_id).await {
-                Ok(data) => Some(data),
+                Ok(data) => {
+                    // Process cover art once and cache it
+                    match cover_art::process_cover_art(&data) {
+                        Ok(processed) => Some(Arc::new(processed)),
+                        Err(e) => {
+                            warn!("Failed to process cover art: {}", e);
+                            None
+                        }
+                    }
+                }
                 Err(e) => {
                     warn!("Failed to download cover art: {}", e);
                     None
@@ -295,11 +316,13 @@ impl SyncEngine {
         let track_count = album_details.song.len();
 
         // Send start event
-        let _ = progress_tx.send(SyncProgress::AlbumStarted {
-            artist: artist.to_string(),
-            album: album.name.clone(),
-            track_count,
-        }).await;
+        let _ = progress_tx
+            .send(SyncProgress::AlbumStarted {
+                artist: artist.to_string(),
+                album: album.name.clone(),
+                track_count,
+            })
+            .await;
 
         // Create download tasks
         let tasks: Vec<DownloadTask> = album_details
@@ -312,75 +335,108 @@ impl SyncEngine {
             })
             .collect();
 
-        // Download tracks one by one with progress updates
-        let mut downloads = Vec::new();
-        for (idx, task) in tasks.into_iter().enumerate() {
-            let download = self.downloader.download_one(task).await?;
-            downloads.push(download);
+        // Stage 1: Download all tracks in parallel
+        let client = self.downloader.client_arc();
+        let parallelism = self.pipeline_config.download_parallelism;
+        let progress_tx_clone = progress_tx.clone();
 
-            let _ = progress_tx.send(SyncProgress::TrackCompleted {
-                track_num: idx + 1,
-                total_tracks: track_count,
-            }).await;
-        }
-
-        let mut total_bytes: u64 = 0;
-
-        // Write tracks to device with embedded cover art
-        for download in &downloads {
-            let track_num = download.song.track.unwrap_or(1);
-            let extension = download.song.suffix.as_deref().unwrap_or("mp3");
-
-            // Embed cover art if available
-            let audio_data = if let Some(ref cover) = cover_data {
-                match cover_art::embed_cover_art_in_memory(&download.data, cover, extension) {
-                    Ok(data) => {
-                        debug!("Embedded cover art in: {}", download.song.title);
-                        data.into()
-                    }
+        let downloads: Vec<DownloadResult> = stream::iter(tasks)
+            .map(|task| {
+                let client = client.clone();
+                async move {
+                    let data = client.download(&task.song.id).await?;
+                    Ok::<_, anyhow::Error>(DownloadResult {
+                        song: task.song,
+                        data,
+                        artist: task.artist,
+                        album: task.album,
+                    })
+                }
+            })
+            .buffer_unordered(parallelism)
+            .filter_map(|result| async {
+                match result {
+                    Ok(r) => Some(r),
                     Err(e) => {
-                        warn!("Failed to embed cover art in {}: {}", download.song.title, e);
-                        download.data.clone()
+                        warn!("Download failed: {}", e);
+                        None
                     }
                 }
-            } else {
-                download.data.clone()
-            };
+            })
+            .collect()
+            .await;
 
-            total_bytes += audio_data.len() as u64;
+        // Send progress event for downloads completion
+        let _ = progress_tx_clone
+            .send(SyncProgress::TrackCompleted {
+                track_num: downloads.len(),
+                total_tracks: track_count,
+            })
+            .await;
+
+        // Stage 2: Convert to DownloadedTrack for pipeline processing
+        let downloaded_tracks: Vec<DownloadedTrack> = downloads
+            .into_iter()
+            .map(|dl| DownloadedTrack {
+                song: dl.song.clone(),
+                audio_data: dl.data,
+                artist: dl.artist,
+                album: dl.album,
+                track_number: dl.song.track.unwrap_or(1),
+            })
+            .collect();
+
+        // Stage 3: Process cover art embedding in parallel
+        let processed_tracks = process_tracks_parallel(
+            downloaded_tracks,
+            processed_cover.clone(),
+            self.pipeline_config.processing_parallelism,
+            None, // Events handled at album level
+        )
+        .await;
+
+        // Stage 4: Write tracks to device
+        let mut total_bytes: u64 = 0;
+        for track in &processed_tracks {
+            let extension = track.song.suffix.as_deref().unwrap_or("mp3");
+
+            total_bytes += track.final_audio_data.len() as u64;
 
             self.storage
                 .write_album_track(
-                    &download.artist,
-                    &download.album,
-                    track_num,
-                    &download.song.title,
+                    &track.artist,
+                    &track.album,
+                    track.track_number,
+                    &track.song.title,
                     extension,
-                    &audio_data,
+                    &track.final_audio_data,
                 )
                 .await?;
         }
 
         // Also save cover art as file (for file browsers/fallback)
-        if let Some(ref cover) = cover_data {
-            if let Err(e) = self.storage.write_cover_art(artist, &album.name, cover).await {
+        if let Some(ref cover) = processed_cover
+            && let Err(e) = self
+                .storage
+                .write_cover_art(artist, &album.name, cover)
+                .await
+            {
                 debug!("Failed to write cover.jpg: {}", e);
             }
-        }
 
         // Update manifest
         self.manifest.add_album(SyncedAlbum {
             id: album.id.clone(),
             artist: artist.to_string(),
             album: album.name.clone(),
-            track_count: downloads.len() as u32,
+            track_count: processed_tracks.len() as u32,
             synced_at: Utc::now(),
         });
 
-        Ok((downloads.len(), total_bytes))
+        Ok((processed_tracks.len(), total_bytes))
     }
 
-    /// Sync a single playlist with progress reporting
+    /// Sync a single playlist with progress reporting (pipelined parallel version)
     async fn sync_playlist_with_progress(
         &mut self,
         playlist: &Playlist,
@@ -399,10 +455,12 @@ impl SyncEngine {
         let track_count = playlist_details.songs.len();
 
         // Send start event
-        let _ = progress_tx.send(SyncProgress::PlaylistStarted {
-            name: playlist.name.clone(),
-            track_count,
-        }).await;
+        let _ = progress_tx
+            .send(SyncProgress::PlaylistStarted {
+                name: playlist.name.clone(),
+                track_count,
+            })
+            .await;
 
         // Create download tasks with cover art IDs
         let tasks_with_covers: Vec<(DownloadTask, Option<String>)> = playlist_details
@@ -411,7 +469,10 @@ impl SyncEngine {
             .map(|song| {
                 let task = DownloadTask {
                     song: song.clone(),
-                    artist: song.artist.clone().unwrap_or_else(|| "Unknown Artist".to_string()),
+                    artist: song
+                        .artist
+                        .clone()
+                        .unwrap_or_else(|| "Unknown Artist".to_string()),
                     album: playlist.name.clone(),
                 };
                 let cover_id = song.cover_art.clone();
@@ -419,64 +480,168 @@ impl SyncEngine {
             })
             .collect();
 
-        let mut total_bytes: u64 = 0;
-        let mut track_filenames: Vec<String> = Vec::new();
+        // Stage 1: Download all tracks and their covers in parallel
+        let client = self.downloader.client_arc();
+        let parallelism = self.pipeline_config.download_parallelism;
 
-        // Download and write tracks one by one with progress updates
-        for (idx, (task, cover_id)) in tasks_with_covers.into_iter().enumerate() {
-            let download = self.downloader.download_one(task).await?;
+        // Download struct to hold track + its cover
+        struct PlaylistDownload {
+            download: DownloadResult,
+            cover_data: Option<Bytes>,
+            cover_id: Option<String>,
+        }
 
-            // Download cover art for this track
-            let cover_data = if let Some(ref cid) = cover_id {
-                match self.downloader.download_cover_art(cid).await {
-                    Ok(data) => Some(data),
+        let downloads: Vec<PlaylistDownload> = stream::iter(tasks_with_covers)
+            .map(|(task, cover_id)| {
+                let client = client.clone();
+                let cover_id_clone = cover_id.clone();
+                async move {
+                    // Download the track
+                    let data = client.download(&task.song.id).await?;
+                    let download = DownloadResult {
+                        song: task.song,
+                        data,
+                        artist: task.artist,
+                        album: task.album,
+                    };
+
+                    // Download cover art if available
+                    let cover_data = if let Some(ref cid) = cover_id_clone {
+                        match client.get_cover_art(cid, Some(500)).await {
+                            Ok(data) => Some(data),
+                            Err(e) => {
+                                debug!("Failed to download cover for playlist track: {}", e);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    Ok::<_, anyhow::Error>(PlaylistDownload {
+                        download,
+                        cover_data,
+                        cover_id: cover_id_clone,
+                    })
+                }
+            })
+            .buffer_unordered(parallelism)
+            .filter_map(|result| async {
+                match result {
+                    Ok(r) => Some(r),
                     Err(e) => {
-                        debug!("Failed to download cover for playlist track: {}", e);
+                        warn!("Download failed: {}", e);
                         None
                     }
                 }
-            } else {
-                None
-            };
+            })
+            .collect()
+            .await;
 
-            let extension = download.song.suffix.as_deref().unwrap_or("mp3");
-            let artist = download.song.artist.as_deref().unwrap_or("Unknown Artist");
+        // Send progress event for downloads completion
+        let _ = progress_tx
+            .send(SyncProgress::TrackCompleted {
+                track_num: downloads.len(),
+                total_tracks: track_count,
+            })
+            .await;
 
-            // Embed cover art if available
-            let audio_data = if let Some(ref cover) = cover_data {
-                match cover_art::embed_cover_art_in_memory(&download.data, cover, extension) {
-                    Ok(data) => {
-                        debug!("Embedded cover art in playlist track: {}", download.song.title);
-                        data.into()
-                    }
-                    Err(e) => {
-                        warn!("Failed to embed cover art in {}: {}", download.song.title, e);
-                        download.data.clone()
+        // Stage 2: Process covers and embed in parallel
+        // Use a cache to avoid reprocessing the same cover for different tracks
+        let mut cover_cache: std::collections::HashMap<String, Arc<Vec<u8>>> =
+            std::collections::HashMap::new();
+
+        // Pre-process unique covers
+        for dl in &downloads {
+            if let (Some(cover_id), Some(cover_data)) = (&dl.cover_id, &dl.cover_data)
+                && !cover_cache.contains_key(cover_id) {
+                    match cover_art::process_cover_art(cover_data) {
+                        Ok(processed) => {
+                            cover_cache.insert(cover_id.clone(), Arc::new(processed));
+                        }
+                        Err(e) => {
+                            warn!("Failed to process cover {}: {}", cover_id, e);
+                        }
                     }
                 }
-            } else {
-                download.data.clone()
-            };
+        }
 
-            total_bytes += audio_data.len() as u64;
+        // Stage 3: Embed covers in parallel using spawn_blocking
+        use crate::sync::pipeline::embed_cover_art_async;
+        use tokio::sync::Semaphore;
+
+        let semaphore = Arc::new(Semaphore::new(self.pipeline_config.processing_parallelism));
+        let mut embed_handles = Vec::with_capacity(downloads.len());
+
+        for dl in downloads {
+            let processed_cover = dl
+                .cover_id
+                .as_ref()
+                .and_then(|id| cover_cache.get(id).cloned());
+
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let extension = dl
+                .download
+                .song
+                .suffix
+                .clone()
+                .unwrap_or_else(|| "mp3".to_string());
+            let audio_data = dl.download.data.clone();
+            let song = dl.download.song.clone();
+            let artist = dl.download.artist.clone();
+
+            let handle = tokio::spawn(async move {
+                let _permit = permit;
+
+                let final_data = if let Some(cover) = processed_cover {
+                    match embed_cover_art_async(audio_data.clone(), cover, extension.clone()).await
+                    {
+                        Ok(data) => data,
+                        Err(e) => {
+                            warn!("Failed to embed cover in {}: {}", song.title, e);
+                            audio_data.to_vec()
+                        }
+                    }
+                } else {
+                    audio_data.to_vec()
+                };
+
+                (song, artist, extension, final_data)
+            });
+
+            embed_handles.push(handle);
+        }
+
+        // Collect processed tracks
+        let mut processed_tracks = Vec::with_capacity(embed_handles.len());
+        for handle in embed_handles {
+            match handle.await {
+                Ok(result) => processed_tracks.push(result),
+                Err(e) => {
+                    warn!("Embed task panicked: {}", e);
+                }
+            }
+        }
+
+        // Stage 4: Write tracks to device
+        let mut total_bytes: u64 = 0;
+        let mut track_filenames: Vec<String> = Vec::new();
+
+        for (song, artist, extension, final_data) in &processed_tracks {
+            total_bytes += final_data.len() as u64;
 
             let filename = self
                 .storage
                 .write_playlist_track(
                     &playlist.name,
                     artist,
-                    &download.song.title,
+                    &song.title,
                     extension,
-                    &audio_data,
+                    final_data,
                 )
                 .await?;
 
             track_filenames.push(filename);
-
-            let _ = progress_tx.send(SyncProgress::TrackCompleted {
-                track_num: idx + 1,
-                total_tracks: track_count,
-            }).await;
         }
 
         // Write M3U playlist file
@@ -582,11 +747,10 @@ impl SyncEngine {
         }
 
         // Also save cover art as file (for file browsers/fallback)
-        if let Some(ref cover) = cover_data {
-            if let Err(e) = self.storage.write_cover_art(artist, &album.name, cover).await {
+        if let Some(ref cover) = cover_data
+            && let Err(e) = self.storage.write_cover_art(artist, &album.name, cover).await {
                 debug!("Failed to write cover.jpg: {}", e);
             }
-        }
 
         // Update manifest
         self.manifest.add_album(SyncedAlbum {

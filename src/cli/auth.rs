@@ -116,22 +116,6 @@ impl AuthManager {
         Ok(())
     }
 
-    /// Clear stored credentials
-    pub fn clear() -> Result<()> {
-        let _ = Self::get_entry("url")?.delete_credential();
-        let _ = Self::get_entry("username")?.delete_credential();
-        let _ = Self::get_entry("password")?.delete_credential();
-        info!("Credentials cleared from keyring");
-        Ok(())
-    }
-
-    /// Check if credentials exist in keyring
-    pub fn exists() -> bool {
-        Self::get_entry("url")
-            .and_then(|e| e.get_password().map_err(|e| anyhow::anyhow!("{}", e)))
-            .is_ok()
-    }
-
     /// Verify credentials by pinging the Subsonic server
     async fn verify(creds: &SubsonicCredentials) -> Result<()> {
         use crate::subsonic::SubsonicClient;

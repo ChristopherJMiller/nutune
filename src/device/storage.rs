@@ -1,7 +1,7 @@
 //! Device storage operations
 
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::fs;
 use tracing::debug;
 
@@ -16,11 +16,6 @@ impl DeviceStorage {
     /// Create a new storage manager for a device
     pub fn new(mount_point: PathBuf) -> Self {
         Self { root: mount_point }
-    }
-
-    /// Get the root path
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     /// Get path to Artists directory
@@ -158,30 +153,5 @@ impl DeviceStorage {
 
         debug!("Wrote M3U: {} ({} tracks)", m3u_path.display(), tracks.len());
         Ok(m3u_path)
-    }
-
-    /// Check if an album folder exists
-    pub async fn album_exists(&self, artist: &str, album: &str) -> bool {
-        let artist_safe = sanitize_filename(artist);
-        let album_safe = sanitize_filename(album);
-        let album_path = self.artists_dir().join(&artist_safe).join(&album_safe);
-        album_path.exists()
-    }
-
-    /// Check if a playlist folder exists
-    pub async fn playlist_exists(&self, name: &str) -> bool {
-        let name_safe = sanitize_filename(name);
-        let playlist_path = self.playlists_dir().join(&name_safe);
-        playlist_path.exists()
-    }
-
-    /// Get available space on device in bytes
-    pub fn available_space(&self) -> Result<u64> {
-        use std::os::unix::fs::MetadataExt;
-
-        let stat = nix::sys::statvfs::statvfs(&self.root)
-            .context("Failed to get filesystem stats")?;
-
-        Ok(stat.blocks_available() * stat.block_size())
     }
 }

@@ -233,13 +233,11 @@ impl SubsonicClient {
             .context("Failed to read download response")?;
 
         // If JSON content type, check for error
-        if content_type.contains("json") {
-            if let Ok(error) = serde_json::from_slice::<SubsonicResponse<()>>(&bytes) {
-                if let Some(err) = error.subsonic_response.error {
+        if content_type.contains("json")
+            && let Ok(error) = serde_json::from_slice::<SubsonicResponse<()>>(&bytes)
+                && let Some(err) = error.subsonic_response.error {
                     anyhow::bail!("Download failed: {} (code {})", err.message, err.code);
                 }
-            }
-        }
 
         Ok(bytes)
     }

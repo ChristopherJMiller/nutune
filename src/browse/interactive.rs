@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     prelude::*,
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::Line,
     widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
@@ -68,6 +68,10 @@ struct BrowserState {
     list_state: ListState,
     selected_albums: HashSet<String>,
     selected_playlists: HashSet<String>,
+    /// Artists with all albums selected (for display purposes)
+    selected_artists: HashSet<String>,
+    /// Cache of album IDs per artist for quick lookup
+    artist_album_ids: std::collections::HashMap<String, Vec<String>>,
     status_message: String,
     sync_progress: SyncProgressInfo,
     selected_device: Option<Device>,
@@ -75,6 +79,20 @@ struct BrowserState {
     progress_rx: Option<mpsc::Receiver<SyncProgressEvent>>,
     /// Selection being synced
     sync_selection: Option<SyncSelection>,
+    /// Albums already synced to device (from manifest)
+    synced_album_ids: HashSet<String>,
+    /// Playlists already synced to device (from manifest)
+    synced_playlist_ids: HashSet<String>,
+    /// Active device for sync status display
+    active_device: Option<Device>,
+    /// Search/filter mode
+    search_mode: bool,
+    /// Current search query
+    search_query: String,
+    /// Filtered indices (maps display index to original index)
+    filtered_indices: Vec<usize>,
+    /// Show help overlay
+    show_help: bool,
 }
 
 impl BrowserState {
@@ -92,15 +110,136 @@ impl BrowserState {
             list_state,
             selected_albums: HashSet::new(),
             selected_playlists: HashSet::new(),
+            selected_artists: HashSet::new(),
+            artist_album_ids: std::collections::HashMap::new(),
             status_message: String::new(),
             sync_progress: SyncProgressInfo::default(),
             selected_device: None,
             progress_rx: None,
             sync_selection: None,
+            synced_album_ids: HashSet::new(),
+            synced_playlist_ids: HashSet::new(),
+            active_device: None,
+            search_mode: false,
+            search_query: String::new(),
+            filtered_indices: Vec::new(),
+            show_help: false,
+        }
+    }
+
+    /// Load synced content from a device's manifest
+    fn load_synced_content(&mut self, device: &Device) {
+        if let Ok(Some(manifest)) = crate::device::SyncManifest::load(&device.mount_point) {
+            self.synced_album_ids = manifest.synced_albums.iter().map(|a| a.id.clone()).collect();
+            self.synced_playlist_ids = manifest.synced_playlists.iter().map(|p| p.id.clone()).collect();
+            self.active_device = Some(device.clone());
+        }
+    }
+
+    /// Toggle selection of all albums for an artist
+    fn toggle_artist_selection(&mut self, artist_id: &str) {
+        if let Some(album_ids) = self.artist_album_ids.get(artist_id) {
+            let album_ids = album_ids.clone();
+            let all_selected = album_ids.iter().all(|id| self.selected_albums.contains(id));
+
+            if all_selected {
+                // Deselect all albums for this artist
+                for id in &album_ids {
+                    self.selected_albums.remove(id);
+                }
+                self.selected_artists.remove(artist_id);
+            } else {
+                // Select all albums for this artist
+                for id in &album_ids {
+                    self.selected_albums.insert(id.clone());
+                }
+                self.selected_artists.insert(artist_id.to_string());
+            }
+        }
+    }
+
+    /// Check if an artist is fully selected (all albums selected)
+    fn is_artist_selected(&self, artist_id: &str) -> bool {
+        if let Some(album_ids) = self.artist_album_ids.get(artist_id) {
+            !album_ids.is_empty() && album_ids.iter().all(|id| self.selected_albums.contains(id))
+        } else {
+            false
+        }
+    }
+
+    /// Update artist selection status based on current album selections
+    fn update_artist_selection_status(&mut self) {
+        let artist_ids: Vec<String> = self.artist_album_ids.keys().cloned().collect();
+        for artist_id in artist_ids {
+            if self.is_artist_selected(&artist_id) {
+                self.selected_artists.insert(artist_id);
+            } else {
+                self.selected_artists.remove(&artist_id);
+            }
+        }
+    }
+
+    /// Apply search filter to current view
+    fn apply_filter(&mut self) {
+        let query = self.search_query.to_lowercase();
+        if query.is_empty() {
+            self.filtered_indices.clear();
+            return;
+        }
+
+        self.filtered_indices = match &self.view {
+            BrowseView::Artists => self
+                .artists
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.name.to_lowercase().contains(&query))
+                .map(|(i, _)| i)
+                .collect(),
+            BrowseView::Albums { .. } => self
+                .albums
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.name.to_lowercase().contains(&query))
+                .map(|(i, _)| i)
+                .collect(),
+            BrowseView::Playlists => self
+                .playlists
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.name.to_lowercase().contains(&query))
+                .map(|(i, _)| i)
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        // Reset selection to first filtered item
+        if !self.filtered_indices.is_empty() {
+            self.list_state.select(Some(0));
+        }
+    }
+
+    /// Clear search filter
+    fn clear_filter(&mut self) {
+        self.search_mode = false;
+        self.search_query.clear();
+        self.filtered_indices.clear();
+    }
+
+    /// Get the actual index in the original list from display index
+    fn get_actual_index(&self, display_idx: usize) -> usize {
+        if self.filtered_indices.is_empty() {
+            display_idx
+        } else {
+            self.filtered_indices.get(display_idx).copied().unwrap_or(display_idx)
         }
     }
 
     fn current_list_len(&self) -> usize {
+        // If we have a filter active, use filtered count
+        if !self.filtered_indices.is_empty() {
+            return self.filtered_indices.len();
+        }
+
         match &self.view {
             BrowseView::Artists => self.artists.len(),
             BrowseView::Albums { .. } => self.albums.len(),
@@ -157,6 +296,9 @@ impl BrowserState {
 
 /// Run the interactive browser
 pub async fn run_browser(client: &SubsonicClient, initial_view: BrowseView) -> Result<BrowseResult> {
+    // Enable TUI mode to suppress stderr logging
+    crate::utils::set_tui_mode(true);
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -166,6 +308,12 @@ pub async fn run_browser(client: &SubsonicClient, initial_view: BrowseView) -> R
 
     // Create state
     let mut state = BrowserState::new(initial_view.clone());
+
+    // Try to detect connected device and load its sync manifest
+    if let Ok(devices) = DeviceDetector::scan().await
+        && let Some(device) = devices.first() {
+            state.load_synced_content(device);
+        }
 
     // Load initial data
     state.status_message = "Loading...".to_string();
@@ -190,6 +338,9 @@ pub async fn run_browser(client: &SubsonicClient, initial_view: BrowseView) -> R
     // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+
+    // Disable TUI mode to restore normal logging
+    crate::utils::set_tui_mode(false);
 
     result
 }
@@ -223,14 +374,43 @@ async fn run_browser_loop(
         terminal.draw(|f| draw_ui(f, state))?;
 
         // Handle input
-        if event::poll(std::time::Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(std::time::Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
 
+                // Handle help overlay first
+                if state.show_help {
+                    // Any key closes help
+                    state.show_help = false;
+                    continue;
+                }
+
+                // Handle search mode input
+                if state.search_mode {
+                    match key.code {
+                        KeyCode::Esc => {
+                            state.clear_filter();
+                        }
+                        KeyCode::Enter => {
+                            state.search_mode = false;
+                        }
+                        KeyCode::Backspace => {
+                            state.search_query.pop();
+                            state.apply_filter();
+                        }
+                        KeyCode::Char(c) => {
+                            state.search_query.push(c);
+                            state.apply_filter();
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => {
+                    KeyCode::Char('q') => {
                         if state.view == BrowseView::DeviceSelection {
                             // Go back to previous view
                             state.view = BrowseView::Artists;
@@ -248,6 +428,17 @@ async fn run_browser_loop(
                             // Don't allow quitting during sync
                         } else {
                             // Return selection without device
+                            return Ok(BrowseResult::SelectionOnly(build_selection(state, client).await?));
+                        }
+                    }
+                    KeyCode::Esc => {
+                        // Esc clears filter if active, otherwise quits
+                        if !state.search_query.is_empty() {
+                            state.clear_filter();
+                        } else if state.view == BrowseView::DeviceSelection {
+                            state.view = BrowseView::Artists;
+                            state.list_state.select(Some(0));
+                        } else if state.view != BrowseView::SyncProgress {
                             return Ok(BrowseResult::SelectionOnly(build_selection(state, client).await?));
                         }
                     }
@@ -311,6 +502,23 @@ async fn run_browser_loop(
                             handle_select_all(state);
                         }
                     }
+                    KeyCode::Char('A') => {
+                        // Deselect all in current view
+                        if state.view != BrowseView::SyncProgress {
+                            handle_deselect_all(state);
+                        }
+                    }
+                    KeyCode::Char('/') => {
+                        // Enter search mode
+                        if state.view != BrowseView::DeviceSelection && state.view != BrowseView::SyncProgress {
+                            state.search_mode = true;
+                            state.search_query.clear();
+                        }
+                    }
+                    KeyCode::Char('?') => {
+                        // Toggle help overlay
+                        state.show_help = !state.show_help;
+                    }
                     KeyCode::Tab => {
                         if state.view != BrowseView::DeviceSelection && state.view != BrowseView::SyncProgress {
                             handle_tab(state, client).await?;
@@ -319,7 +527,6 @@ async fn run_browser_loop(
                     _ => {}
                 }
             }
-        }
     }
 }
 
@@ -478,35 +685,44 @@ async fn handle_device_select(state: &mut BrowserState, client: &SubsonicClient)
 }
 
 async fn handle_enter(state: &mut BrowserState, client: &SubsonicClient) -> Result<()> {
-    let selected = state.list_state.selected().unwrap_or(0);
+    let display_idx = state.list_state.selected().unwrap_or(0);
+    let actual_idx = state.get_actual_index(display_idx);
 
     match &state.view {
         BrowseView::Artists => {
-            if let Some(artist) = state.artists.get(selected) {
+            if let Some(artist) = state.artists.get(actual_idx) {
                 state.status_message = format!("Loading albums for {}...", artist.name);
                 let artist_details = client.get_artist(&artist.id).await?;
+
+                // Cache album IDs for this artist (for artist-level selection)
+                let album_ids: Vec<String> = artist_details.album.iter().map(|a| a.id.clone()).collect();
+                state.artist_album_ids.insert(artist.id.clone(), album_ids);
+
                 state.albums = artist_details.album;
                 state.view = BrowseView::Albums {
                     artist_id: artist.id.clone(),
                     artist_name: artist.name.clone(),
                 };
+                state.clear_filter(); // Clear filter when navigating
                 state.list_state.select(Some(0));
                 state.status_message.clear();
             }
         }
         BrowseView::Albums { .. } => {
-            if let Some(album) = state.albums.get(selected) {
+            if let Some(album) = state.albums.get(actual_idx) {
                 state.view = BrowseView::AlbumTracks {
                     album: album.clone(),
                 };
+                state.clear_filter();
                 state.list_state.select(Some(0));
             }
         }
         BrowseView::Playlists => {
-            if let Some(playlist) = state.playlists.get(selected) {
+            if let Some(playlist) = state.playlists.get(actual_idx) {
                 state.view = BrowseView::PlaylistTracks {
                     playlist: playlist.clone(),
                 };
+                state.clear_filter();
                 state.list_state.select(Some(0));
             }
         }
@@ -538,20 +754,30 @@ async fn handle_back(state: &mut BrowserState, _client: &SubsonicClient) -> Resu
 }
 
 fn handle_toggle(state: &mut BrowserState) {
-    let selected = state.list_state.selected().unwrap_or(0);
+    let display_idx = state.list_state.selected().unwrap_or(0);
+    let actual_idx = state.get_actual_index(display_idx);
 
     match &state.view {
+        BrowseView::Artists => {
+            // Toggle all albums for this artist
+            if let Some(artist) = state.artists.get(actual_idx) {
+                let artist_id = artist.id.clone();
+                state.toggle_artist_selection(&artist_id);
+            }
+        }
         BrowseView::Albums { .. } => {
-            if let Some(album) = state.albums.get(selected) {
+            if let Some(album) = state.albums.get(actual_idx) {
                 if state.selected_albums.contains(&album.id) {
                     state.selected_albums.remove(&album.id);
                 } else {
                     state.selected_albums.insert(album.id.clone());
                 }
+                // Update artist selection status
+                state.update_artist_selection_status();
             }
         }
         BrowseView::Playlists => {
-            if let Some(playlist) = state.playlists.get(selected) {
+            if let Some(playlist) = state.playlists.get(actual_idx) {
                 if state.selected_playlists.contains(&playlist.id) {
                     state.selected_playlists.remove(&playlist.id);
                 } else {
@@ -569,11 +795,45 @@ fn handle_select_all(state: &mut BrowserState) {
             for album in &state.albums {
                 state.selected_albums.insert(album.id.clone());
             }
+            state.update_artist_selection_status();
         }
         BrowseView::Playlists => {
             for playlist in &state.playlists {
                 state.selected_playlists.insert(playlist.id.clone());
             }
+        }
+        BrowseView::Artists => {
+            // Select all visited artists
+            for artist_id in state.artist_album_ids.keys() {
+                if let Some(album_ids) = state.artist_album_ids.get(artist_id).cloned() {
+                    for album_id in album_ids {
+                        state.selected_albums.insert(album_id);
+                    }
+                    state.selected_artists.insert(artist_id.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_deselect_all(state: &mut BrowserState) {
+    match &state.view {
+        BrowseView::Albums { .. } => {
+            for album in &state.albums {
+                state.selected_albums.remove(&album.id);
+            }
+            state.update_artist_selection_status();
+        }
+        BrowseView::Playlists => {
+            for playlist in &state.playlists {
+                state.selected_playlists.remove(&playlist.id);
+            }
+        }
+        BrowseView::Artists => {
+            // Deselect all albums and artists
+            state.selected_albums.clear();
+            state.selected_artists.clear();
         }
         _ => {}
     }
@@ -790,29 +1050,71 @@ fn draw_ui(f: &mut Frame, state: &BrowserState) {
         .block(Block::default().borders(Borders::BOTTOM));
     f.render_widget(header, chunks[0]);
 
+    // Build the list of indices to display (either filtered or all)
+    let artist_indices: Vec<usize> = if !state.filtered_indices.is_empty() {
+        state.filtered_indices.clone()
+    } else {
+        (0..state.artists.len()).collect()
+    };
+
+    let album_indices: Vec<usize> = if !state.filtered_indices.is_empty() {
+        state.filtered_indices.clone()
+    } else {
+        (0..state.albums.len()).collect()
+    };
+
+    let playlist_indices: Vec<usize> = if !state.filtered_indices.is_empty() {
+        state.filtered_indices.clone()
+    } else {
+        (0..state.playlists.len()).collect()
+    };
+
     // List
     let items: Vec<ListItem> = match &state.view {
-        BrowseView::Artists => state
-            .artists
+        BrowseView::Artists => artist_indices
             .iter()
+            .filter_map(|&i| state.artists.get(i))
             .map(|a| {
                 let album_count = a.album_count.map(|c| format!(" ({} albums)", c)).unwrap_or_default();
-                ListItem::new(format!("{}{}", a.name, album_count))
+
+                // Check if artist is fully or partially selected
+                let (prefix, style) = if let Some(album_ids) = state.artist_album_ids.get(&a.id) {
+                    let selected_count = album_ids.iter().filter(|id| state.selected_albums.contains(*id)).count();
+                    if selected_count == album_ids.len() && !album_ids.is_empty() {
+                        // All albums selected
+                        ("[x] ", Style::default().fg(Color::Green))
+                    } else if selected_count > 0 {
+                        // Some albums selected
+                        ("[-] ", Style::default().fg(Color::Yellow))
+                    } else {
+                        // No albums selected
+                        ("[ ] ", Style::default())
+                    }
+                } else {
+                    // Haven't visited this artist yet, no checkbox
+                    ("    ", Style::default())
+                };
+
+                ListItem::new(format!("{}{}{}", prefix, a.name, album_count)).style(style)
             })
             .collect(),
-        BrowseView::Albums { .. } => state
-            .albums
+        BrowseView::Albums { .. } => album_indices
             .iter()
+            .filter_map(|&i| state.albums.get(i))
             .map(|a| {
                 let selected = state.selected_albums.contains(&a.id);
+                let synced = state.synced_album_ids.contains(&a.id);
                 let prefix = if selected { "[x] " } else { "[ ] " };
+                let suffix = if synced { " [SYNCED]" } else { "" };
                 let year = a.year.map(|y| format!(" ({})", y)).unwrap_or_default();
                 let style = if selected {
                     Style::default().fg(Color::Green)
+                } else if synced {
+                    Style::default().fg(Color::Cyan)
                 } else {
                     Style::default()
                 };
-                ListItem::new(format!("{}{}{}", prefix, a.name, year)).style(style)
+                ListItem::new(format!("{}{}{}{}", prefix, a.name, year, suffix)).style(style)
             })
             .collect(),
         BrowseView::AlbumTracks { album } => {
@@ -821,19 +1123,23 @@ fn draw_ui(f: &mut Frame, state: &BrowserState) {
                 album.song_count.unwrap_or(0)
             ))]
         }
-        BrowseView::Playlists => state
-            .playlists
+        BrowseView::Playlists => playlist_indices
             .iter()
+            .filter_map(|&i| state.playlists.get(i))
             .map(|p| {
                 let selected = state.selected_playlists.contains(&p.id);
+                let synced = state.synced_playlist_ids.contains(&p.id);
                 let prefix = if selected { "[x] " } else { "[ ] " };
+                let suffix = if synced { " [SYNCED]" } else { "" };
                 let count = p.song_count.map(|c| format!(" ({} tracks)", c)).unwrap_or_default();
                 let style = if selected {
                     Style::default().fg(Color::Green)
+                } else if synced {
+                    Style::default().fg(Color::Cyan)
                 } else {
                     Style::default()
                 };
-                ListItem::new(format!("{}{}{}", prefix, p.name, count)).style(style)
+                ListItem::new(format!("{}{}{}{}", prefix, p.name, count, suffix)).style(style)
             })
             .collect(),
         BrowseView::PlaylistTracks { playlist } => {
@@ -888,13 +1194,21 @@ fn draw_ui(f: &mut Frame, state: &BrowserState) {
 
     f.render_stateful_widget(list, chunks[1], &mut state.list_state.clone());
 
-    // Footer/help
+    // Footer/help with device info
+    let device_info = if let Some(ref device) = state.active_device {
+        let name = device.display_name();
+        let free_gb = device.free_space as f64 / 1_073_741_824.0;
+        format!(" | Device: {} ({:.1} GB free)", name, free_gb)
+    } else {
+        String::new()
+    };
+
     let help_text = match &state.view {
-        BrowseView::Artists => "↑/↓: Navigate | Enter: View albums | Tab: Playlists | q: Done",
-        BrowseView::Albums { .. } => "↑/↓: Navigate | Space: Select | a: Select all | Enter: Preview | Backspace: Back | Tab: Playlists | s: Sync | q: Done",
-        BrowseView::Playlists => "↑/↓: Navigate | Space: Select | a: Select all | Tab: Artists | s: Sync | q: Done",
-        BrowseView::DeviceSelection => "↑/↓: Navigate | Enter: Sync to device | Backspace/q: Cancel",
-        _ => "Backspace: Back | q: Done",
+        BrowseView::Artists => format!("↑/↓: Navigate | Space: Select | /: Search | ?: Help | s: Sync | q: Done{}", device_info),
+        BrowseView::Albums { .. } => format!("↑/↓: Navigate | Space: Select | a/A: All/None | /: Search | ?: Help | s: Sync | q: Done{}", device_info),
+        BrowseView::Playlists => format!("↑/↓: Navigate | Space: Select | a/A: All/None | /: Search | ?: Help | s: Sync | q: Done{}", device_info),
+        BrowseView::DeviceSelection => "↑/↓: Navigate | Enter: Sync to device | Backspace/q: Cancel".to_string(),
+        _ => "Backspace: Back | q: Done".to_string(),
     };
 
     let footer = Paragraph::new(help_text)
@@ -902,8 +1216,60 @@ fn draw_ui(f: &mut Frame, state: &BrowserState) {
         .block(Block::default().borders(Borders::TOP));
     f.render_widget(footer, chunks[2]);
 
+    // Search input overlay
+    if state.search_mode || !state.search_query.is_empty() {
+        let search_text = if state.search_mode {
+            format!("Search: {}█", state.search_query)
+        } else {
+            format!("Filter: {} (Esc to clear)", state.search_query)
+        };
+        let search_style = if state.search_mode {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        let search = Paragraph::new(search_text)
+            .style(search_style)
+            .block(Block::default().borders(Borders::ALL).title("Search"));
+        let area = centered_rect(60, 3, f.area());
+        f.render_widget(search, area);
+    }
+
+    // Help overlay
+    if state.show_help {
+        let help_lines = vec![
+            Line::from("Keyboard Shortcuts"),
+            Line::from(""),
+            Line::styled("Navigation", Style::default().add_modifier(Modifier::BOLD)),
+            Line::from("  ↑/k, ↓/j    Move up/down"),
+            Line::from("  Enter/l     Enter/expand"),
+            Line::from("  Backspace/h Go back"),
+            Line::from("  Tab         Switch Artists/Playlists"),
+            Line::from(""),
+            Line::styled("Selection", Style::default().add_modifier(Modifier::BOLD)),
+            Line::from("  Space       Toggle selection"),
+            Line::from("  a           Select all in view"),
+            Line::from("  A           Deselect all in view"),
+            Line::from(""),
+            Line::styled("Search & Actions", Style::default().add_modifier(Modifier::BOLD)),
+            Line::from("  /           Search/filter"),
+            Line::from("  s           Sync to device"),
+            Line::from("  q, Esc      Quit/Cancel"),
+            Line::from(""),
+            Line::styled("Press any key to close", Style::default().fg(Color::DarkGray)),
+        ];
+        let help_popup = Paragraph::new(help_lines)
+            .block(Block::default()
+                .borders(Borders::ALL)
+                .title("Help")
+                .style(Style::default().bg(Color::Black)));
+        let area = centered_rect(50, 22, f.area());
+        f.render_widget(ratatui::widgets::Clear, area);
+        f.render_widget(help_popup, area);
+    }
+
     // Status message overlay
-    if !state.status_message.is_empty() {
+    if !state.status_message.is_empty() && !state.show_help {
         let status = Paragraph::new(state.status_message.clone())
             .style(Style::default().fg(Color::Yellow))
             .block(Block::default().borders(Borders::ALL));

@@ -432,14 +432,14 @@ async fn run_browser_loop(
                         }
                     }
                     KeyCode::Esc => {
-                        // Esc clears filter if active, otherwise quits
+                        // Esc clears filter if active, otherwise acts like backspace
                         if !state.search_query.is_empty() {
                             state.clear_filter();
                         } else if state.view == BrowseView::DeviceSelection {
                             state.view = BrowseView::Artists;
                             state.list_state.select(Some(0));
                         } else if state.view != BrowseView::SyncProgress {
-                            return Ok(BrowseResult::SelectionOnly(build_selection(state, client).await?));
+                            handle_back(state, client).await?;
                         }
                     }
                     KeyCode::Char('s') => {
@@ -494,7 +494,7 @@ async fn run_browser_loop(
                     }
                     KeyCode::Char(' ') => {
                         if state.view != BrowseView::SyncProgress {
-                            handle_toggle(state);
+                            handle_toggle(state, client, terminal).await?;
                         }
                     }
                     KeyCode::Char('a') => {
@@ -753,7 +753,11 @@ async fn handle_back(state: &mut BrowserState, _client: &SubsonicClient) -> Resu
     Ok(())
 }
 
-fn handle_toggle(state: &mut BrowserState) {
+async fn handle_toggle(
+    state: &mut BrowserState,
+    client: &SubsonicClient,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<()> {
     let display_idx = state.list_state.selected().unwrap_or(0);
     let actual_idx = state.get_actual_index(display_idx);
 
@@ -762,6 +766,19 @@ fn handle_toggle(state: &mut BrowserState) {
             // Toggle all albums for this artist
             if let Some(artist) = state.artists.get(actual_idx) {
                 let artist_id = artist.id.clone();
+                let artist_name = artist.name.clone();
+
+                // If we haven't fetched this artist's albums yet, fetch them now
+                if !state.artist_album_ids.contains_key(&artist_id) {
+                    state.status_message = format!("Loading {}...", artist_name);
+                    terminal.draw(|f| draw_ui(f, state))?;
+
+                    let artist_details = client.get_artist(&artist_id).await?;
+                    let album_ids: Vec<String> = artist_details.album.iter().map(|a| a.id.clone()).collect();
+                    state.artist_album_ids.insert(artist_id.clone(), album_ids);
+                    state.status_message.clear();
+                }
+
                 state.toggle_artist_selection(&artist_id);
             }
         }
@@ -787,6 +804,7 @@ fn handle_toggle(state: &mut BrowserState) {
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn handle_select_all(state: &mut BrowserState) {

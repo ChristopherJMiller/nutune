@@ -19,9 +19,9 @@ use std::io;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use crate::device::{Device, DeviceDetector, UnmountedDevice};
+use crate::device::{Device, DeviceDetector, SyncManifest, UnmountedDevice};
 use crate::subsonic::{Album, Artist, Playlist, SubsonicClient, SyncSelection};
-use crate::sync::{SyncEngine, SyncProgress as SyncProgressEvent};
+use crate::sync::{DeletionSelection, SyncEngine, SyncProgress as SyncProgressEvent};
 
 /// Current view in the browser
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +32,7 @@ pub enum BrowseView {
     Playlists,
     PlaylistTracks { playlist: Playlist },
     DeviceSelection,
+    SyncConfirmation,
     SyncProgress,
 }
 
@@ -72,13 +73,19 @@ struct BrowserState {
     selected_artists: HashSet<String>,
     /// Cache of album IDs per artist for quick lookup
     artist_album_ids: std::collections::HashMap<String, Vec<String>>,
+    /// Cache of Album objects by ID for selection building
+    album_cache: std::collections::HashMap<String, Album>,
     status_message: String,
+    /// When the status message was set (for auto-clear timeout)
+    status_message_time: Option<std::time::Instant>,
     sync_progress: SyncProgressInfo,
     selected_device: Option<Device>,
     /// Receiver for sync progress events
     progress_rx: Option<mpsc::Receiver<SyncProgressEvent>>,
     /// Selection being synced
     sync_selection: Option<SyncSelection>,
+    /// Deletions pending for sync
+    pending_deletions: Option<DeletionSelection>,
     /// Albums already synced to device (from manifest)
     synced_album_ids: HashSet<String>,
     /// Playlists already synced to device (from manifest)
@@ -112,11 +119,14 @@ impl BrowserState {
             selected_playlists: HashSet::new(),
             selected_artists: HashSet::new(),
             artist_album_ids: std::collections::HashMap::new(),
+            album_cache: std::collections::HashMap::new(),
             status_message: String::new(),
+            status_message_time: None,
             sync_progress: SyncProgressInfo::default(),
             selected_device: None,
             progress_rx: None,
             sync_selection: None,
+            pending_deletions: None,
             synced_album_ids: HashSet::new(),
             synced_playlist_ids: HashSet::new(),
             active_device: None,
@@ -133,6 +143,56 @@ impl BrowserState {
             self.synced_album_ids = manifest.synced_albums.iter().map(|a| a.id.clone()).collect();
             self.synced_playlist_ids = manifest.synced_playlists.iter().map(|p| p.id.clone()).collect();
             self.active_device = Some(device.clone());
+        }
+    }
+
+    /// Load synced content from device and auto-select synced items
+    fn load_and_select_synced_content(&mut self, device: &Device) {
+        if let Ok(Some(manifest)) = crate::device::SyncManifest::load(&device.mount_point) {
+            // Load synced IDs
+            self.synced_album_ids = manifest.synced_albums.iter().map(|a| a.id.clone()).collect();
+            self.synced_playlist_ids = manifest.synced_playlists.iter().map(|p| p.id.clone()).collect();
+            self.active_device = Some(device.clone());
+
+            // Auto-select synced items
+            self.selected_albums = self.synced_album_ids.clone();
+            self.selected_playlists = self.synced_playlist_ids.clone();
+
+            // Group synced albums by artist name
+            let mut albums_by_artist: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+            // Create Album objects from manifest data for albums not in cache
+            for synced in &manifest.synced_albums {
+                // Track album IDs per artist name
+                albums_by_artist
+                    .entry(synced.artist.clone())
+                    .or_default()
+                    .push(synced.id.clone());
+
+                if !self.album_cache.contains_key(&synced.id) {
+                    let album = Album {
+                        id: synced.id.clone(),
+                        name: synced.album.clone(),
+                        artist: Some(synced.artist.clone()),
+                        artist_id: None,
+                        cover_art: None,
+                        song_count: Some(synced.track_count),
+                        duration: None,
+                        year: None,
+                        genre: None,
+                    };
+                    self.album_cache.insert(album.id.clone(), album);
+                }
+            }
+
+            // Populate artist_album_ids by matching artist names to IDs
+            for (artist_name, album_ids) in albums_by_artist {
+                if let Some(artist) = self.artists.iter().find(|a| a.name == artist_name) {
+                    self.artist_album_ids.insert(artist.id.clone(), album_ids);
+                }
+            }
+
+            self.update_artist_selection_status();
         }
     }
 
@@ -176,6 +236,27 @@ impl BrowserState {
             } else {
                 self.selected_artists.remove(&artist_id);
             }
+        }
+    }
+
+    /// Set status message with auto-clear timeout
+    fn set_status(&mut self, message: impl Into<String>) {
+        self.status_message = message.into();
+        self.status_message_time = Some(std::time::Instant::now());
+    }
+
+    /// Clear status message
+    fn clear_status(&mut self) {
+        self.status_message.clear();
+        self.status_message_time = None;
+    }
+
+    /// Check and clear status message if timeout expired (3 seconds)
+    fn check_status_timeout(&mut self) {
+        if let Some(time) = self.status_message_time
+            && time.elapsed() > std::time::Duration::from_secs(3)
+        {
+            self.clear_status();
         }
     }
 
@@ -248,6 +329,7 @@ impl BrowserState {
             BrowseView::PlaylistTracks { playlist } => playlist.song_count.unwrap_or(0) as usize,
             BrowseView::DeviceSelection => self.mounted_devices.len() + self.unmounted_devices.len(),
             BrowseView::SyncProgress => self.sync_progress.log_messages.len(),
+            BrowseView::SyncConfirmation => 2, // Yes/No options
         }
     }
 
@@ -324,7 +406,7 @@ pub async fn run_browser(client: &SubsonicClient, initial_view: BrowseView) -> R
         BrowseView::Playlists | BrowseView::PlaylistTracks { .. } => {
             state.playlists = client.get_playlists().await?;
         }
-        BrowseView::DeviceSelection | BrowseView::SyncProgress => {
+        BrowseView::DeviceSelection | BrowseView::SyncProgress | BrowseView::SyncConfirmation => {
             // Load devices if starting in device selection (shouldn't happen normally)
             state.mounted_devices = DeviceDetector::scan().await.unwrap_or_default();
             state.unmounted_devices = DeviceDetector::scan_unmounted().await.unwrap_or_default();
@@ -369,6 +451,9 @@ async fn run_browser_loop(
                 handle_sync_progress_event(state, event);
             }
         }
+
+        // Check for status message timeout
+        state.check_status_timeout();
 
         // Draw UI
         terminal.draw(|f| draw_ui(f, state))?;
@@ -438,31 +523,60 @@ async fn run_browser_loop(
                         } else if state.view == BrowseView::DeviceSelection {
                             state.view = BrowseView::Artists;
                             state.list_state.select(Some(0));
+                        } else if state.view == BrowseView::SyncConfirmation {
+                            // Cancel sync confirmation
+                            state.sync_selection = None;
+                            state.pending_deletions = None;
+                            state.view = BrowseView::Artists;
+                            state.list_state.select(Some(0));
                         } else if state.view != BrowseView::SyncProgress {
                             handle_back(state, client).await?;
                         }
                     }
                     KeyCode::Char('s') => {
-                        // Show device selection
-                        if state.view != BrowseView::DeviceSelection && state.view != BrowseView::SyncProgress {
+                        // Start sync
+                        if state.view != BrowseView::DeviceSelection && state.view != BrowseView::SyncProgress && state.view != BrowseView::SyncConfirmation {
                             let selection = build_selection(state, client).await?;
-                            if selection.is_empty() {
-                                state.status_message = "No items selected!".to_string();
-                            } else {
-                                // Load devices and switch to device selection view
-                                state.status_message = "Loading devices...".to_string();
-                                terminal.draw(|f| draw_ui(f, state))?;
+                            let deletions = calculate_deletions(state);
 
-                                state.mounted_devices = DeviceDetector::scan().await.unwrap_or_default();
-                                state.unmounted_devices = DeviceDetector::scan_unmounted().await.unwrap_or_default();
-                                state.status_message.clear();
-
-                                if state.total_devices() == 0 {
-                                    state.status_message = "No devices found! Connect a device and try again.".to_string();
+                            if selection.is_empty() && deletions.is_empty() {
+                                if state.selected_albums.is_empty() && state.selected_playlists.is_empty() {
+                                    state.set_status("No items selected!");
                                 } else {
-                                    state.view = BrowseView::DeviceSelection;
-                                    state.list_state.select(Some(0));
+                                    state.set_status("All selected items already synced");
                                 }
+                            } else if state.selected_device.is_some() {
+                                // Device already selected
+                                if !deletions.is_empty() {
+                                    // Show confirmation for deletions
+                                    state.sync_selection = Some(selection);
+                                    state.pending_deletions = Some(deletions);
+                                    state.view = BrowseView::SyncConfirmation;
+                                } else {
+                                    // No deletions, start sync directly
+                                    start_sync(state, client, selection, deletions).await?;
+                                }
+                            } else {
+                                // No device selected yet
+                                state.set_status("Select a device first with 'd'");
+                            }
+                        }
+                    }
+                    KeyCode::Char('d') => {
+                        // Select device
+                        if state.view != BrowseView::DeviceSelection && state.view != BrowseView::SyncProgress {
+                            state.status_message = "Loading devices...".to_string();
+                            terminal.draw(|f| draw_ui(f, state))?;
+
+                            state.mounted_devices = DeviceDetector::scan().await.unwrap_or_default();
+                            state.unmounted_devices = DeviceDetector::scan_unmounted().await.unwrap_or_default();
+                            state.status_message.clear();
+
+                            if state.total_devices() == 0 {
+                                state.status_message = "No devices found! Connect a device and try again.".to_string();
+                            } else {
+                                state.view = BrowseView::DeviceSelection;
+                                state.list_state.select(Some(0));
                             }
                         }
                     }
@@ -478,8 +592,13 @@ async fn run_browser_loop(
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                         if state.view == BrowseView::DeviceSelection {
-                            // Select device and start sync
+                            // Select device and load synced content
                             handle_device_select(state, client).await?;
+                        } else if state.view == BrowseView::SyncConfirmation {
+                            // Confirm sync with deletions
+                            if let (Some(selection), Some(deletions)) = (state.sync_selection.take(), state.pending_deletions.take()) {
+                                start_sync(state, client, selection, deletions).await?;
+                            }
                         } else if state.view != BrowseView::SyncProgress {
                             handle_enter(state, client).await?;
                         }
@@ -594,19 +713,98 @@ fn handle_sync_progress_event(state: &mut BrowserState, event: SyncProgressEvent
             state.sync_progress.error = Some(message.clone());
             state.sync_progress.log_messages.push(format!("ERROR: {}", message));
         }
-        SyncProgressEvent::Complete { albums_synced, playlists_synced, tracks_downloaded, bytes_downloaded } => {
+        SyncProgressEvent::Complete { albums_synced, playlists_synced, tracks_downloaded, bytes_downloaded, albums_deleted, playlists_deleted } => {
             state.sync_progress.is_complete = true;
             state.sync_progress.bytes_downloaded = bytes_downloaded;
             let mb = bytes_downloaded as f64 / 1_048_576.0;
+            let delete_info = if albums_deleted > 0 || playlists_deleted > 0 {
+                format!(", deleted {} albums, {} playlists", albums_deleted, playlists_deleted)
+            } else {
+                String::new()
+            };
             state.sync_progress.log_messages.push(format!(
-                "Sync complete! {} albums, {} playlists, {} tracks ({:.1} MB)",
-                albums_synced, playlists_synced, tracks_downloaded, mb
+                "Sync complete! {} albums, {} playlists, {} tracks ({:.1} MB){}",
+                albums_synced, playlists_synced, tracks_downloaded, mb, delete_info
+            ));
+        }
+        SyncProgressEvent::DeletionStarted { albums_to_delete, playlists_to_delete } => {
+            state.sync_progress.log_messages.push(format!(
+                "Deleting {} albums, {} playlists...",
+                albums_to_delete, playlists_to_delete
+            ));
+        }
+        SyncProgressEvent::AlbumDeleted { artist, album } => {
+            state.sync_progress.log_messages.push(format!(
+                "  Deleted: {} - {}", artist, album
+            ));
+        }
+        SyncProgressEvent::AlbumDeleteFailed { artist, album, error } => {
+            state.sync_progress.log_messages.push(format!(
+                "  DELETE FAILED: {} - {} ({})", artist, album, error
+            ));
+        }
+        SyncProgressEvent::PlaylistDeleted { name } => {
+            state.sync_progress.log_messages.push(format!(
+                "  Deleted playlist: {}", name
+            ));
+        }
+        SyncProgressEvent::PlaylistDeleteFailed { name, error } => {
+            state.sync_progress.log_messages.push(format!(
+                "  DELETE FAILED: {} ({})", name, error
             ));
         }
     }
 }
 
-async fn handle_device_select(state: &mut BrowserState, client: &SubsonicClient) -> Result<bool> {
+/// Start sync with the selected device
+async fn start_sync(state: &mut BrowserState, client: &SubsonicClient, selection: SyncSelection, deletions: DeletionSelection) -> Result<()> {
+    let Some(ref device) = state.selected_device else {
+        state.status_message = "No device selected!".to_string();
+        return Ok(());
+    };
+
+    // Create progress channel
+    let (tx, rx) = mpsc::channel::<SyncProgressEvent>(100);
+
+    // Store state for sync
+    state.sync_selection = Some(selection.clone());
+    state.pending_deletions = Some(deletions.clone());
+    state.progress_rx = Some(rx);
+    state.sync_progress = SyncProgressInfo {
+        albums_total: selection.albums.len(),
+        ..Default::default()
+    };
+
+    // Spawn sync task
+    let device_path = device.mount_point.clone();
+    let client_clone = client.clone();
+    tokio::spawn(async move {
+        let mut engine = match SyncEngine::new(client_clone, device_path, 4) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = tx.send(SyncProgressEvent::Error {
+                    message: format!("Failed to create sync engine: {}", e),
+                }).await;
+                return;
+            }
+        };
+
+        if let Err(e) = engine.sync_with_progress(&selection, &deletions, tx.clone()).await {
+            let _ = tx.send(SyncProgressEvent::Error {
+                message: format!("Sync failed: {}", e),
+            }).await;
+        }
+    });
+
+    // Switch to sync progress view
+    state.view = BrowseView::SyncProgress;
+    state.status_message.clear();
+
+    Ok(())
+}
+
+/// Handle device selection - loads synced content and returns to browse
+async fn handle_device_select(state: &mut BrowserState, _client: &SubsonicClient) -> Result<bool> {
     let selected = state.list_state.selected().unwrap_or(0);
     let mounted_count = state.mounted_devices.len();
 
@@ -641,45 +839,23 @@ async fn handle_device_select(state: &mut BrowserState, client: &SubsonicClient)
         return Ok(false);
     };
 
-    // Build selection and start sync
-    let selection = build_selection(state, client).await?;
-
-    // Create progress channel
-    let (tx, rx) = mpsc::channel::<SyncProgressEvent>(100);
-
-    // Store state for sync
+    // Load synced content and auto-select
+    state.load_and_select_synced_content(&device);
     state.selected_device = Some(device.clone());
-    state.sync_selection = Some(selection.clone());
-    state.progress_rx = Some(rx);
-    state.sync_progress = SyncProgressInfo {
-        albums_total: selection.albums.len(),
-        ..Default::default()
-    };
 
-    // Spawn sync task
-    let device_path = device.mount_point.clone();
-    let client_clone = client.clone();
-    tokio::spawn(async move {
-        let mut engine = match SyncEngine::new(client_clone, device_path, 4) {
-            Ok(e) => e,
-            Err(e) => {
-                let _ = tx.send(SyncProgressEvent::Error {
-                    message: format!("Failed to create sync engine: {}", e),
-                }).await;
-                return;
-            }
-        };
+    // Count synced items
+    let album_count = state.selected_albums.len();
+    let playlist_count = state.selected_playlists.len();
 
-        if let Err(e) = engine.sync_with_progress(&selection, tx.clone()).await {
-            let _ = tx.send(SyncProgressEvent::Error {
-                message: format!("Sync failed: {}", e),
-            }).await;
-        }
-    });
-
-    // Switch to sync progress view
-    state.view = BrowseView::SyncProgress;
-    state.status_message.clear();
+    // Return to Artists view
+    state.view = BrowseView::Artists;
+    state.list_state.select(Some(0));
+    state.set_status(format!(
+        "Device: {} - {} albums, {} playlists synced",
+        device.display_name(),
+        album_count,
+        playlist_count
+    ));
 
     Ok(true)
 }
@@ -699,6 +875,10 @@ async fn handle_enter(state: &mut BrowserState, client: &SubsonicClient) -> Resu
                 state.artist_album_ids.insert(artist.id.clone(), album_ids);
 
                 state.albums = artist_details.album;
+                // Populate album cache for selection building
+                for album in &state.albums {
+                    state.album_cache.insert(album.id.clone(), album.clone());
+                }
                 state.view = BrowseView::Albums {
                     artist_id: artist.id.clone(),
                     artist_name: artist.name.clone(),
@@ -776,6 +956,10 @@ async fn handle_toggle(
                     let artist_details = client.get_artist(&artist_id).await?;
                     let album_ids: Vec<String> = artist_details.album.iter().map(|a| a.id.clone()).collect();
                     state.artist_album_ids.insert(artist_id.clone(), album_ids);
+                    // Cache album objects for selection building
+                    for album in artist_details.album {
+                        state.album_cache.insert(album.id.clone(), album);
+                    }
                     state.status_message.clear();
                 }
 
@@ -879,8 +1063,8 @@ async fn handle_tab(state: &mut BrowserState, client: &SubsonicClient) -> Result
             state.view = BrowseView::Artists;
             state.list_state.select(Some(0));
         }
-        BrowseView::DeviceSelection | BrowseView::SyncProgress => {
-            // Don't switch views from device selection or sync progress
+        BrowseView::DeviceSelection | BrowseView::SyncProgress | BrowseView::SyncConfirmation => {
+            // Don't switch views from device selection, sync progress, or confirmation
         }
     }
     Ok(())
@@ -889,22 +1073,61 @@ async fn handle_tab(state: &mut BrowserState, client: &SubsonicClient) -> Result
 async fn build_selection(state: &BrowserState, _client: &SubsonicClient) -> Result<SyncSelection> {
     let mut selection = SyncSelection::new();
 
-    // Add selected albums
+    // Add selected albums that are NOT already synced
     for album_id in &state.selected_albums {
-        // Find album in loaded albums or fetch it
-        if let Some(album) = state.albums.iter().find(|a| &a.id == album_id) {
+        if !state.synced_album_ids.contains(album_id)
+            && let Some(album) = state.album_cache.get(album_id)
+        {
             selection.albums.push(album.clone());
         }
     }
 
-    // Add selected playlists
+    // Add selected playlists that are NOT already synced
     for playlist_id in &state.selected_playlists {
-        if let Some(playlist) = state.playlists.iter().find(|p| &p.id == playlist_id) {
+        if !state.synced_playlist_ids.contains(playlist_id)
+            && let Some(playlist) = state.playlists.iter().find(|p| &p.id == playlist_id)
+        {
             selection.playlists.push(playlist.clone());
         }
     }
 
     Ok(selection)
+}
+
+/// Calculate items to delete (synced but no longer selected)
+fn calculate_deletions(state: &BrowserState) -> DeletionSelection {
+    let mut deletions = DeletionSelection::default();
+
+    // Find albums to delete: synced but not selected
+    if let Some(device) = &state.active_device
+        && let Ok(Some(manifest)) = SyncManifest::load(&device.mount_point)
+    {
+        for album_id in &state.synced_album_ids {
+            if !state.selected_albums.contains(album_id)
+                && let Some(synced) = manifest.synced_albums.iter().find(|a| &a.id == album_id)
+            {
+                deletions.albums.push((
+                    album_id.clone(),
+                    synced.artist.clone(),
+                    synced.album.clone(),
+                ));
+            }
+        }
+
+        // Find playlists to delete: synced but not selected
+        for playlist_id in &state.synced_playlist_ids {
+            if !state.selected_playlists.contains(playlist_id)
+                && let Some(synced) = manifest.synced_playlists.iter().find(|p| &p.id == playlist_id)
+            {
+                deletions.playlists.push((
+                    playlist_id.clone(),
+                    synced.name.clone(),
+                ));
+            }
+        }
+    }
+
+    deletions
 }
 
 /// Draw the sync progress view
@@ -1029,10 +1252,71 @@ fn draw_sync_progress(f: &mut Frame, state: &BrowserState) {
     f.render_widget(footer, chunks[4]);
 }
 
+/// Draw the sync confirmation view
+fn draw_sync_confirmation(f: &mut Frame, state: &BrowserState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Header
+            Constraint::Min(10),    // Content
+            Constraint::Length(3),  // Footer
+        ])
+        .split(f.area());
+
+    let header = Paragraph::new("Sync Confirmation")
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .block(Block::default().borders(Borders::BOTTOM));
+    f.render_widget(header, chunks[0]);
+
+    let mut lines = vec![];
+
+    if let Some(ref deletions) = state.pending_deletions
+        && (!deletions.albums.is_empty() || !deletions.playlists.is_empty())
+    {
+        lines.push(Line::styled("Will DELETE:", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+        for (_, artist, album) in &deletions.albums {
+            lines.push(Line::styled(format!("  - {} - {}", artist, album), Style::default().fg(Color::Red)));
+        }
+        for (_, name) in &deletions.playlists {
+            lines.push(Line::styled(format!("  - Playlist: {}", name), Style::default().fg(Color::Red)));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if let Some(ref selection) = state.sync_selection
+        && (!selection.albums.is_empty() || !selection.playlists.is_empty())
+    {
+        lines.push(Line::styled("Will ADD:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+        for album in &selection.albums {
+            let artist = album.artist.as_deref().unwrap_or("Unknown");
+            lines.push(Line::styled(format!("  + {} - {}", artist, album.name), Style::default().fg(Color::Green)));
+        }
+        for playlist in &selection.playlists {
+            lines.push(Line::styled(format!("  + Playlist: {}", playlist.name), Style::default().fg(Color::Green)));
+        }
+    }
+
+    let content = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL))
+        .wrap(Wrap { trim: false });
+    f.render_widget(content, chunks[1]);
+
+    let footer = Paragraph::new("Press Enter to confirm, Esc to cancel")
+        .style(Style::default().fg(Color::DarkGray))
+        .block(Block::default().borders(Borders::TOP));
+    f.render_widget(footer, chunks[2]);
+}
+
 fn draw_ui(f: &mut Frame, state: &BrowserState) {
     // Special layout for sync progress view
     if state.view == BrowseView::SyncProgress {
         draw_sync_progress(f, state);
+        return;
+    }
+
+    // Special layout for sync confirmation view
+    if state.view == BrowseView::SyncConfirmation {
+        draw_sync_confirmation(f, state);
         return;
     }
 
@@ -1053,6 +1337,7 @@ fn draw_ui(f: &mut Frame, state: &BrowserState) {
         BrowseView::Playlists => "Playlists",
         BrowseView::PlaylistTracks { playlist } => &playlist.name,
         BrowseView::DeviceSelection => "Select Device",
+        BrowseView::SyncConfirmation => "Confirm Sync",
         BrowseView::SyncProgress => "Syncing...",
     };
 
@@ -1199,6 +1484,10 @@ fn draw_ui(f: &mut Frame, state: &BrowserState) {
             // This case should never be reached due to early return, but compiler needs it
             vec![]
         }
+        BrowseView::SyncConfirmation => {
+            // This case should never be reached due to separate draw function, but compiler needs it
+            vec![]
+        }
     };
 
     let list = List::new(items)
@@ -1222,10 +1511,10 @@ fn draw_ui(f: &mut Frame, state: &BrowserState) {
     };
 
     let help_text = match &state.view {
-        BrowseView::Artists => format!("↑/↓: Navigate | Space: Select | /: Search | ?: Help | s: Sync | q: Done{}", device_info),
-        BrowseView::Albums { .. } => format!("↑/↓: Navigate | Space: Select | a/A: All/None | /: Search | ?: Help | s: Sync | q: Done{}", device_info),
-        BrowseView::Playlists => format!("↑/↓: Navigate | Space: Select | a/A: All/None | /: Search | ?: Help | s: Sync | q: Done{}", device_info),
-        BrowseView::DeviceSelection => "↑/↓: Navigate | Enter: Sync to device | Backspace/q: Cancel".to_string(),
+        BrowseView::Artists => format!("↑/↓: Navigate | Space: Select | /: Search | ?: Help | d: Device | s: Sync | q: Done{}", device_info),
+        BrowseView::Albums { .. } => format!("↑/↓: Navigate | Space: Select | a/A: All/None | /: Search | d: Device | s: Sync | q: Done{}", device_info),
+        BrowseView::Playlists => format!("↑/↓: Navigate | Space: Select | a/A: All/None | /: Search | d: Device | s: Sync | q: Done{}", device_info),
+        BrowseView::DeviceSelection => "↑/↓: Navigate | Enter: Select device | Backspace/q: Cancel".to_string(),
         _ => "Backspace: Back | q: Done".to_string(),
     };
 
@@ -1271,7 +1560,8 @@ fn draw_ui(f: &mut Frame, state: &BrowserState) {
             Line::from(""),
             Line::styled("Search & Actions", Style::default().add_modifier(Modifier::BOLD)),
             Line::from("  /           Search/filter"),
-            Line::from("  s           Sync to device"),
+            Line::from("  d           Select device"),
+            Line::from("  s           Start sync"),
             Line::from("  q, Esc      Quit/Cancel"),
             Line::from(""),
             Line::styled("Press any key to close", Style::default().fg(Color::DarkGray)),

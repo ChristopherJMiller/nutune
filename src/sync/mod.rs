@@ -4,4 +4,4 @@ pub mod downloader;
 pub mod engine;
 pub mod pipeline;
 
-pub use engine::{SyncEngine, SyncProgress};
+pub use engine::{DeletionSelection, SyncEngine, SyncProgress};

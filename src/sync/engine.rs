@@ -68,7 +68,49 @@ pub enum SyncProgress {
         playlists_synced: usize,
         tracks_downloaded: usize,
         bytes_downloaded: u64,
+        albums_deleted: usize,
+        playlists_deleted: usize,
     },
+    /// Deletion phase starting
+    DeletionStarted {
+        albums_to_delete: usize,
+        playlists_to_delete: usize,
+    },
+    /// An album was deleted
+    AlbumDeleted {
+        artist: String,
+        album: String,
+    },
+    /// Album deletion failed
+    AlbumDeleteFailed {
+        artist: String,
+        album: String,
+        error: String,
+    },
+    /// A playlist was deleted
+    PlaylistDeleted {
+        name: String,
+    },
+    /// Playlist deletion failed
+    PlaylistDeleteFailed {
+        name: String,
+        error: String,
+    },
+}
+
+/// Items to be deleted from device
+#[derive(Debug, Clone, Default)]
+pub struct DeletionSelection {
+    /// Album IDs to delete (id, artist, album_name)
+    pub albums: Vec<(String, String, String)>,
+    /// Playlist IDs to delete (id, name)
+    pub playlists: Vec<(String, String)>,
+}
+
+impl DeletionSelection {
+    pub fn is_empty(&self) -> bool {
+        self.albums.is_empty() && self.playlists.is_empty()
+    }
 }
 
 /// Result of a sync operation
@@ -186,10 +228,73 @@ impl SyncEngine {
         Ok(result)
     }
 
+    /// Delete items that are no longer selected
+    pub async fn delete_deselected(
+        &mut self,
+        deletions: &DeletionSelection,
+        progress_tx: &mpsc::Sender<SyncProgress>,
+    ) -> Result<(usize, usize)> {
+        let mut albums_deleted = 0;
+        let mut playlists_deleted = 0;
+
+        if deletions.is_empty() {
+            return Ok((0, 0));
+        }
+
+        // Send start event
+        let _ = progress_tx.send(SyncProgress::DeletionStarted {
+            albums_to_delete: deletions.albums.len(),
+            playlists_to_delete: deletions.playlists.len(),
+        }).await;
+
+        // Delete albums
+        for (album_id, artist, album) in &deletions.albums {
+            match self.storage.delete_album(artist, album).await {
+                Ok(()) => {
+                    self.manifest.remove_album(album_id);
+                    albums_deleted += 1;
+                    let _ = progress_tx.send(SyncProgress::AlbumDeleted {
+                        artist: artist.clone(),
+                        album: album.clone(),
+                    }).await;
+                }
+                Err(e) => {
+                    let _ = progress_tx.send(SyncProgress::AlbumDeleteFailed {
+                        artist: artist.clone(),
+                        album: album.clone(),
+                        error: e.to_string(),
+                    }).await;
+                }
+            }
+        }
+
+        // Delete playlists
+        for (playlist_id, name) in &deletions.playlists {
+            match self.storage.delete_playlist(name).await {
+                Ok(()) => {
+                    self.manifest.remove_playlist(playlist_id);
+                    playlists_deleted += 1;
+                    let _ = progress_tx.send(SyncProgress::PlaylistDeleted {
+                        name: name.clone(),
+                    }).await;
+                }
+                Err(e) => {
+                    let _ = progress_tx.send(SyncProgress::PlaylistDeleteFailed {
+                        name: name.clone(),
+                        error: e.to_string(),
+                    }).await;
+                }
+            }
+        }
+
+        Ok((albums_deleted, playlists_deleted))
+    }
+
     /// Execute sync with progress updates sent to a channel (for TUI)
     pub async fn sync_with_progress(
         &mut self,
         selection: &SyncSelection,
+        deletions: &DeletionSelection,
         progress_tx: mpsc::Sender<SyncProgress>,
     ) -> Result<SyncResult> {
         let mut result = SyncResult::default();
@@ -197,7 +302,10 @@ impl SyncEngine {
         // Initialize storage directories
         self.storage.init().await?;
 
-        // Send start event
+        // Phase 1: Delete deselected items first
+        let (albums_deleted, playlists_deleted) = self.delete_deselected(deletions, &progress_tx).await?;
+
+        // Send start event for downloads
         let _ = progress_tx.send(SyncProgress::Started {
             total_albums: selection.albums.len(),
             total_playlists: selection.playlists.len(),
@@ -268,6 +376,8 @@ impl SyncEngine {
             playlists_synced: result.playlists_synced,
             tracks_downloaded: result.tracks_downloaded,
             bytes_downloaded: result.bytes_downloaded,
+            albums_deleted,
+            playlists_deleted,
         }).await;
 
         Ok(result)

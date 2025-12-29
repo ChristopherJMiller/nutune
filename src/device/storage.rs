@@ -154,4 +154,44 @@ impl DeviceStorage {
         debug!("Wrote M3U: {} ({} tracks)", m3u_path.display(), tracks.len());
         Ok(m3u_path)
     }
+
+    /// Delete an album folder and all its contents
+    pub async fn delete_album(&self, artist: &str, album: &str) -> Result<()> {
+        let artist_safe = sanitize_filename(artist);
+        let album_safe = sanitize_filename(album);
+        let album_path = self.artists_dir().join(&artist_safe).join(&album_safe);
+
+        if album_path.exists() {
+            fs::remove_dir_all(&album_path)
+                .await
+                .context("Failed to delete album directory")?;
+            debug!("Deleted album folder: {}", album_path.display());
+
+            // Clean up empty artist folder if no albums remain
+            let artist_path = self.artists_dir().join(&artist_safe);
+            if let Ok(mut entries) = fs::read_dir(&artist_path).await
+                && entries.next_entry().await?.is_none()
+            {
+                let _ = fs::remove_dir(&artist_path).await;
+                debug!("Cleaned up empty artist folder: {}", artist_path.display());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete a playlist folder and all its contents
+    pub async fn delete_playlist(&self, name: &str) -> Result<()> {
+        let name_safe = sanitize_filename(name);
+        let playlist_path = self.playlists_dir().join(&name_safe);
+
+        if playlist_path.exists() {
+            fs::remove_dir_all(&playlist_path)
+                .await
+                .context("Failed to delete playlist directory")?;
+            debug!("Deleted playlist folder: {}", playlist_path.display());
+        }
+
+        Ok(())
+    }
 }

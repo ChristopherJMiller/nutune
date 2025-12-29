@@ -126,4 +126,16 @@ impl SyncManifest {
         self.synced_playlists.push(playlist);
         self.last_sync = Utc::now();
     }
+
+    /// Remove an album from the manifest
+    pub fn remove_album(&mut self, album_id: &str) -> Option<SyncedAlbum> {
+        let idx = self.synced_albums.iter().position(|a| a.id == album_id);
+        idx.map(|i| self.synced_albums.remove(i))
+    }
+
+    /// Remove a playlist from the manifest
+    pub fn remove_playlist(&mut self, playlist_id: &str) -> Option<SyncedPlaylist> {
+        let idx = self.synced_playlists.iter().position(|p| p.id == playlist_id);
+        idx.map(|i| self.synced_playlists.remove(i))
+    }
 }
